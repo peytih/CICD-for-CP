@@ -1,0 +1,179 @@
+stages:
+  - validate
+  - dependencies
+  - security
+  - build
+  - test
+  - deploy
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  IMAGE_NAME: "test-runner"
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+  CONTAINER_PORT: "80"
+  HOST_PORT: "80"
+  DEPLOY_ENV: "production"
+
+check_structure:
+  stage: validate
+  image: alpine:3.19
+  script:
+    - |
+      echo "-----Проверяю структуру проекта-----"
+      test -f Dockerfile || { echo "-----Ошибка: Dockerfile не найден-----"; exit 1; }
+      
+      DEPS_FOUND=false
+      for f in requirements.txt package.json go.mod pom.xml Cargo.toml composer.json Pipfile; do
+        if [ -f "$f" ]; then
+          DEPS_FOUND=true
+          echo "-----Нашел файл зависимостей: $f-----"
+        fi
+      done
+      
+      $DEPS_FOUND || echo "-----Не нашел стандартные файлы зависи. Пропускаем установку.-----"
+      echo "-----Структура проекта валидна.-----"
+
+install_dependencies:
+  stage: dependencies
+  image: python:3.11-slim
+  before_script:
+    - echo 'Acquire::http::Timeout "30";' > /etc/apt/apt.conf.d/timeout.conf
+    - echo 'Acquire::Retries "3";' >> /etc/apt/apt.conf.d/timeout.conf
+    - echo 'nameserver 8.8.8.8' >> /etc/resolv.conf
+    - apt-get update -qq || apt-get update -qq
+  script:
+    - |
+      if [ -f requirements.txt ]; then
+        pip install --upgrade pip
+        pip install -r requirements.txt
+      elif [ -f package.json ]; then
+        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+        apt-get install -y nodejs
+        npm ci
+      elif [ -f go.mod ]; then
+        apt-get install -y golang-go
+        go mod download
+      else
+        echo "-----Не распознал файл зависимостей. Пропускаю.-----"
+      fi
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}-deps
+    paths:
+      - .venv/
+      - node_modules/
+      - /go/pkg/
+  when: on_success
+
+sast_scan:
+  stage: security
+  image:
+    name: ghcr.io/aquasecurity/trivy:0.69.3
+    entrypoint: [""]
+  variables:
+    TRIVY_CACHE_DIR: ".trivycache"
+  script:
+    - trivy fs 
+        --scanners vuln,secret 
+        --format table 
+        --exit-code 1 
+        --cache-dir .trivycache 
+        .
+  cache:
+    key: trivy-db-cache
+    paths:
+      - .trivycache/
+    policy: pull-push
+  allow_failure: false
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "schedule"
+
+build_image:
+  stage: build
+  image: docker:24.0
+  services:
+    - name: docker:24.0-dind
+      command: ["--tls=false"]
+  variables:
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - docker version
+    - docker build -t "$IMAGE_NAME:$IMAGE_TAG" .
+    - docker save "$IMAGE_NAME:$IMAGE_TAG" | gzip > image.tar.gz
+    - ls -lh image.tar.gz
+  artifacts:
+    paths:
+      - image.tar.gz
+    expire_in: 1 hour
+  when: on_success
+
+test_functional:
+  stage: test
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - docker load -i image.tar.gz
+  script:
+    - |
+      echo "-----Запускаю тестовый контейнер-----"
+      docker run -d --name ci-test-app -p "$HOST_PORT:$CONTAINER_PORT" "$IMAGE_NAME:$IMAGE_TAG"
+      
+      echo "-----Ожидаю запуск сервиса-----"
+      RETRIES=15
+      until curl -s -o /dev/null -w "%{http_code}" "http://localhost:$HOST_PORT/" | grep -qE "200|301|302|401|403"; do
+        RETRIES=$((RETRIES - 1))
+        if [ $RETRIES -le 0 ]; then
+          echo "-----Сервис не запустился за отведенное время.-----"
+          docker logs ci-test-app
+          exit 1
+        fi
+        echo "-----Повторяю попытки ($RETRIES)-----"
+        sleep 5
+      done
+      
+      echo "-----Веб-интерфейс доступен. Завершил проверку.-----"
+      docker logs ci-test-app
+      docker stop ci-test-app && docker rm ci-test-app
+  allow_failure: false
+  needs:
+    - build_image
+
+deploy:
+  stage: deploy
+  image: alpine:3.19
+  before_script:
+    - apk add --no-cache openssh-client bash
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo "$DEPLOY_SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - ssh-keyscan -H "$SERVER_ADDRESS" >> ~/.ssh/known_hosts 2>/dev/null || true
+  script:
+    - |
+      echo "-----Выгружаем на $SERVER_ADDRESS-----"
+      
+      scp image.tar.gz root@"$SERVER_ADDRESS":/tmp/image.tar.gz
+      
+      ssh root@"$SERVER_ADDRESS" "
+        docker load -i /tmp/image.tar.gz &&
+        docker stop app-container 2>/dev/null || true &&
+        docker rm app-container 2>/dev/null || true &&
+        docker run -d --name app-container --restart always \
+          -p $HOST_PORT:$CONTAINER_PORT \
+          $IMAGE_NAME:$IMAGE_TAG &&
+        rm /tmp/image.tar.gz &&
+        echo '-----Контейнер запущен-----'
+      "
+      echo "-----Выгрузка завершена!-----"
+  when: manual
+  environment:
+    name: "$DEPLOY_ENV"
+  allow_failure: false
+  timeout: 10m
+  needs:
+    - build_image
